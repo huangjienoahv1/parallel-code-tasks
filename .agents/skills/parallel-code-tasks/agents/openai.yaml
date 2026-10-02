@@ -1,0 +1,4 @@
+interface:
+  display_name: "多工具共用项目"
+  short_description: "让任意 AI 工具随时加入同一 Git 仓库，以独立目录开发并逐个审查回填"
+  default_prompt: "使用 $parallel-code-tasks 为当前工具独立登记任务，在同仓库的专属 worktree 开发、验证并逐个审查回填。"
