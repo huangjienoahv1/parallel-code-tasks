@@ -1,5 +1,7 @@
 # 操作说明
 
+第一次接触 Git/worktree，请先看 [小白使用手册](beginner-guide.md)，其中包含逐步命令、故障恢复分流和归档清理流程。本页保留精确协议条件。
+
 scripts/parallel_tasks.py 使用 Git 和 Python 标准库；只有显式 launch 才启动调用者指定的程序。所有工具调用同一版本。Windows 使用 pwsh.exe（PowerShell 7），Python 3.9+。
 
 ## 持久登记与目录

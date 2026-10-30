@@ -22,6 +22,8 @@ description: 让 Codex、ZCode、OpenCode、Claude Code 或其他编程工具在
 
 读取 [操作说明](references/worktree.md)，首次先运行 `--help`。需要 Git、Python 3.9+；仅使用标准库。Windows 使用 `pwsh.exe`（PowerShell 7）。
 
+向首次使用者讲解或交接时，参考 [小白使用手册](references/beginner-guide.md)，涵盖概念、逐步操作、出错恢复和归档清理。释放资源不会删除 worktree；当前没有自动清理协议历史的命令。
+
 可用 `install` 把完整 Skill、默认配置和短规则安装到目标项目。默认追加 AGENTS.md；其他 Markdown 入口用 `--rules-file` 明确指定。保持原规则，不假定产品自动发现 Skill。不支持规则文件的工具使用 [通用提示词](references/agent-prompts.md)。安装文件需按项目流程审查并纳入基线，脚本不替用户提交。
 
 开始任务：检查 Git 状态、实际分支、HEAD、worktree 列表，以及生效 AGENTS/README。按环境约定使用图谱定位相关代码，明确目标、验收、scope、接口、依赖、资源及验证方式，再登记：

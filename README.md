@@ -4,6 +4,8 @@
 
 采用 **短项目规则 + Skill 工作流程 + Python/Git 脚本**：每个任务一个 worktree 和分支，共享持久登记，独立审查，逐个回填。不要求统一协调 AI，不等待所有任务结束，不自动提交代码。
 
+**第一次使用请阅读 [小白使用手册](.agents/skills/parallel-code-tasks/references/beginner-guide.md)**：从 Git/worktree 概念、环境准备和安装开始，提供 AI 提示词与手动操作两种路线，详细说明交付、暂停接续、出错恢复、成果备份和 worktree 清理。`release` 不删除目录；清理前必须确认成果保存，当前没有自动删除协议历史的命令。
+
 ## 工作方式
 
 ~~~text
