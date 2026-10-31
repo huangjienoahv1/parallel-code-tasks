@@ -16,10 +16,12 @@ import sys
 import uuid
 
 import parallel_support as support
+import parallel_validation as validation
 from parallel_support import WorkflowError, atomic_json, digest, file_mutex, install_bundle, load_config, lock_info, owner_state, render, safe_path, task_environment
 
 
 STATE_VERSION = 2
+PROTOCOL_VERSION = 4
 STATE_DIRECTORY = "parallel-code-tasks"
 RESOURCE_TYPES = {"port", "db", "redis", "docker", "path"}
 ACTION = "update"
@@ -161,9 +163,10 @@ def read_state(directory):
         require(not previous.get("active"), "V1 批次仍在活动；先用原版本交付或人工归档，不能混用两套登记")
     path = directory / "project.json"
     if not path.exists():
-        return {"version": STATE_VERSION, "revision": 0, "protocol": 3, "source": None, "pending": None, "tasks": {}}
+        return {"version": STATE_VERSION, "revision": 0, "protocol": PROTOCOL_VERSION, "source": None, "pending": None, "tasks": {}}
     state = json.loads(path.read_text(encoding="utf-8"))
     require(state.get("version") == STATE_VERSION, "不支持的登记版本")
+    require(state.get("protocol", 2) <= PROTOCOL_VERSION, "登记协议高于当前脚本，请统一升级后再操作")
     state.setdefault("revision", 0)
     for task in state["tasks"].values():
         task.setdefault("revision", 0)
@@ -175,7 +178,7 @@ def read_state(directory):
 
 def write_state(directory, state):
     state["revision"] = state.get("revision", 0) + 1
-    state["protocol"] = 3
+    state["protocol"] = PROTOCOL_VERSION
     temporary = directory / ("state-" + uuid.uuid4().hex + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as stream:
@@ -238,7 +241,7 @@ def snapshot(path, directory, working=True):
 
 
 def files_changed(path, base, tree):
-    result = git(path, "diff", "--name-only", "--no-renames", "-z", base, tree, "--")
+    result = git(path, "diff", "--no-color", "--name-only", "--no-renames", "-z", base, tree, "--")
     return [name.decode("utf-8", "surrogateescape") for name in result.stdout.split(b"\0") if name]
 
 
@@ -251,7 +254,53 @@ def check_scope(path, base, tree, scopes):
 
 def patch(path, base, tree):
     return git(path, "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv",
-               "--no-renames", base, tree, "--").stdout
+               "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-renames", base, tree, "--").stdout
+
+
+def require_tree_merge(path, tree):
+    """在登记候选前实测所需 Git 能力，避免旧 Git 留下半成品。"""
+    result = git(path, "merge-tree", "--write-tree", "-z", f"--merge-base={tree}", tree, tree, check=False)
+    require(result.returncode == 0,
+            "需要支持 merge-tree --write-tree -z --merge-base=<tree> 的 Git，请升级或核查仓库："
+            + result.stderr.decode("utf-8", "replace").strip())
+
+
+def merge_trees(path, base, source, task_tree):
+    """解析 Git 的 NUL 协议，保留无冲突索引的目录重命名冲突。"""
+    result = git(path, "merge-tree", "--write-tree", "--messages", "-z",
+                 f"--merge-base={base}", source, task_tree, check=False)
+    require(result.returncode in {0, 1}, "树合并命令失败：" + result.stderr.decode("utf-8", "replace").strip())
+    parts = result.stdout.split(b"\0")
+    tree = parts.pop(0).decode("ascii")
+    require(bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree)), "Git 树合并未返回有效 tree")
+    entries = []
+    while parts and parts[0]:
+        entry = parts.pop(0)
+        metadata, separator, name = entry.partition(b"\t")
+        require(separator and len(metadata.split()) == 3, "Git 冲突索引输出无效")
+        entries.append((entry, name))
+    if parts:
+        parts.pop(0)
+    messages = []
+    while parts and parts[0]:
+        count = int(parts.pop(0))
+        require(count >= 0 and len(parts) >= count + 2, "Git 冲突消息输出不完整")
+        paths = [parts.pop(0).decode("utf-8", "surrogateescape") for _ in range(count)]
+        kind, message = parts.pop(0).decode("utf-8", "replace"), parts.pop(0).decode("utf-8", "replace")
+        messages.append({"paths": paths, "kind": kind, "message": message})
+    return tree, entries, messages, result.returncode == 1
+
+
+def materialize_merge(path, source_tree, tree, entries):
+    """只在新候选中检出结果并恢复冲突索引；拒绝覆盖额外修改。"""
+    git(path, "read-tree", "-m", "-u", source_tree, tree)
+    if entries:
+        # 合并树含冲突标记；索引恢复 stage 1/2/3，供标准 git add 解决。
+        zero = b"0" * len(tree)
+        names = dict.fromkeys(name for _, name in entries)
+        removals = b"".join(b"0 " + zero + b"\t" + name + b"\0" for name in names)
+        stages = b"".join(entry + b"\0" for entry, _ in entries)
+        git(path, "update-index", "-z", "--index-info", data=removals + stages)
 
 
 def check_worktree(info, common):
@@ -521,6 +570,7 @@ def ready(args, directory, root, common):
 
 def reopen(args, directory, root, common):
     task = load_task(args, directory)
+    no_pending_verification(task)
     require(task["status"] in {TaskStatus.READY, TaskStatus.PREPARED, TaskStatus.CONFLICT, TaskStatus.PREPARING}, "任务不能重新开发")
     require(args.workers_stopped, "先停止旧执行者和候选写入，再 --workers-stopped")
     check_worktree(task, common)
@@ -539,6 +589,12 @@ def candidate_lookup(task, common):
     return candidate, path
 
 
+def no_pending_verification(task):
+    candidate = next((item for item in task["candidates"] if item["id"] == task.get("candidate")), {})
+    require(candidate.get("verification", {}).get("status") not in {"running", "interrupted"},
+            "候选验证记录未结束；停止相关进程后 recover --workers-stopped，再继续")
+
+
 def staged_candidate(task, common, directory):
     candidate, path = candidate_lookup(task, common)
     no_operation(path)
@@ -552,9 +608,11 @@ def staged_candidate(task, common, directory):
 
 def prepare(args, directory, root, common):
     task = load_task(args, directory)
+    no_pending_verification(task)
     require(task["status"] in {TaskStatus.READY, TaskStatus.PREPARED, TaskStatus.CONFLICT, TaskStatus.PREPARING}, "任务尚未 ready 或已回填")
     require(args.reviewed_tree == task["tree"], "任务审查 SHA 已过期")
     path = frozen(task, common, directory)
+    require_tree_merge(path, task["baseline_tree"])
     with locked(directory):
         state = read_state(directory)
         require(not state["pending"], "有中断回填，请先 recover")
@@ -573,14 +631,27 @@ def prepare(args, directory, root, common):
         Path(task["workspace"]).mkdir(parents=True, exist_ok=True)
         git(source, "worktree", "add", "-b", candidate["branch"], candidate["path"], known["head"])
     # 独立目录的耗时应用仅持本任务锁；其他任务可以准备或登记。
-    seed_worktree(candidate["path"], candidate["source_head"], candidate["source_tree"])
-    result = git(candidate["path"], "apply", "--3way", "--index",
-                 data=patch(path, task["baseline_tree"], task["tree"]), check=False)
-    if result.returncode:
-        task["status"] = TaskStatus.CONFLICT if unresolved(candidate["path"]) else TaskStatus.PREPARING
-        candidate["error"] = result.stderr.decode("utf-8", "replace").strip()
+    try:
+        tree, entries, messages, conflicted = merge_trees(
+            candidate["path"], task["baseline_tree"], candidate["source_tree"], task["tree"])
+        candidate.update(merge_tree=tree, merge_conflicted=conflicted, merge_messages=messages)
         save_task(directory, task)
-        raise WorkflowError(f"候选集成失败，现场保留在 {candidate['path']}：{candidate['error']}")
+        files = check_scope(candidate["path"], candidate["source_tree"], tree, task["scope"])
+        with locked(directory):
+            check_claims(read_state(directory), task, files)
+        seed_worktree(candidate["path"], candidate["source_head"], candidate["source_tree"])
+        materialize_merge(candidate["path"], candidate["source_tree"], tree, entries)
+        candidate["merge_complete"] = True
+        validation.provision_candidate(task, candidate, git)
+    except (WorkflowError, OSError, ValueError) as error:
+        candidate.update(failure_kind="prepare-error", error=str(error))
+        save_task(directory, task)
+        raise
+    if conflicted:
+        task["status"] = TaskStatus.CONFLICT
+        candidate["failure_kind"] = "merge-conflict"
+        save_task(directory, task)
+        raise WorkflowError(f"候选存在合并冲突，现场保留在 {candidate['path']}；inspect 查看冲突消息，解决后 resolve")
     _, _, tree, files = staged_candidate(task, common, directory)
     pin(source, f"tasks/{task['key']}/candidate-{attempt}", tree)
     candidate.update(tree=tree, files=files)
@@ -609,11 +680,74 @@ def resolve(args, directory, root, common):
     require(args.reviewed_tree == tree, "冲突解决成果与审查 SHA 不一致")
     with locked(directory):
         check_claims(read_state(directory), task, files)
+    if not candidate.get("environment_path"):
+        validation.provision_candidate(task, candidate, git)
     pin(path, f"tasks/{task['key']}/candidate-{candidate['id']}", tree)
     candidate.update(tree=tree, files=files, resolved_at=now())
     task["status"] = TaskStatus.PREPARED
     save_task(directory, task)
     return {"task": task["id"], "candidate": candidate}
+
+
+def verify(args, directory, root, common):
+    """全程持任务锁，运行验证不持共享锁；结果绑定候选内容与受管环境。"""
+    task = load_task(args, directory)
+    no_pending_verification(task)
+    require(task["status"] == TaskStatus.PREPARED, "仅可验证 prepared 候选；先解决冲突或重新 prepare")
+    require(args.workers_stopped, "先停止开发服务及旧验证进程，再 --workers-stopped；候选复用任务资源")
+    require(validation.verification_config(task)["commands"], "未配置 verification.commands，沿用人工验证与审查")
+    frozen(task, common, directory)
+    candidate, _, tree, files = staged_candidate(task, common, directory)
+    require(args.reviewed_tree == tree == candidate["tree"], "候选与待验证 tree 不一致，请重新 prepare/resolve")
+    previous = candidate.get("verification", {})
+    for process in (task.get("launch", {}), previous):
+        if process.get("status") in {"starting", "running", "interrupted"}:
+            require(not process.get("pid") or owner_state(process) == "missing",
+                    "登记进程仍存在或无法确认已退出，不能复用任务资源验证")
+    with locked(directory):
+        state = read_state(directory)
+        check_claims(state, task, files)
+        _, safe = refresh_source(state, common, directory)
+        require(safe and not state["pending"], "原目录有未知修改或中断回填，先核查后再验证")
+        require(state["source"]["head"] == candidate["source_head"]
+                and state["source"]["tree"] == candidate["source_tree"], "候选基线已过期，请重新 prepare")
+    if not candidate.get("environment_path"):
+        # 旧协议候选没有环境元数据，首次显式验证时补齐。
+        validation.provision_candidate(task, candidate, git)
+        save_task(directory, task)
+    fingerprint, env = validation.candidate_inputs(task, candidate, tree, git)
+    record = validation.new_record(tree, fingerprint, now())
+    candidate["verification"] = record
+    save_task(directory, task)
+    try:
+        exit_code = validation.run_commands(task, candidate, record, env, lambda: save_task(directory, task))
+        if exit_code == 0:
+            frozen(task, common, directory)
+            _, _, actual_tree, _ = staged_candidate(task, common, directory)
+            actual_fingerprint, _ = validation.candidate_inputs(task, candidate, actual_tree, git)
+            require(actual_tree == tree and actual_fingerprint == fingerprint,
+                    "验证期间代码或受管环境改变，结果无效；核查后重新验证")
+        record.update(status="passed" if exit_code == 0 else "failed", exit_code=exit_code, ended=now())
+    except KeyboardInterrupt:
+        record.update(status="interrupted", exit_code=1, ended=now())
+        save_task(directory, task)
+        raise WorkflowError("验证被中断；直接子进程已停止，其他服务需人工核查后 recover --workers-stopped")
+    except (WorkflowError, OSError, ValueError) as error:
+        record.update(status="failed", exit_code=1, error_type=type(error).__name__, ended=now())
+        save_task(directory, task)
+        raise
+    save_task(directory, task)
+    return {"task": task["id"], "candidate": candidate["id"], "verification": record,
+            "exit_code": exit_code, "message": "验证记录已保存；失败/超时后检查日志及残留服务，再继续"}
+
+
+def require_verified(task, candidate, tree):
+    if validation.verification_config(task)["commands"]:
+        record = candidate.get("verification", {})
+        require(record.get("status") == "passed", "已配置验证命令，须先 verify 成功再 publish")
+        fingerprint, _ = validation.candidate_inputs(task, candidate, tree, git)
+        require(record["tree"] == tree and record["fingerprint"] == fingerprint,
+                "候选代码或受管环境与成功验证记录不同，请重新 verify")
 
 
 def finish_publish(task, state, directory, path, tree):
@@ -642,6 +776,7 @@ def publish(args, directory, root, common):
         known = state["source"]
         require(known["head"] == candidate["source_head"] and known["tree"] == candidate["source_tree"],
                 "候选基线已过期；重新 prepare 并审查新结果")
+        require_verified(task, candidate, tree)
         changes = patch(source, known["tree"], tree)
         if changes:
             git(source, "apply", "--check", "--index", data=changes)
@@ -660,6 +795,15 @@ def publish(args, directory, root, common):
 
 def recover(args, directory, root, common):
     task = load_task(args, directory)
+    if task.get("candidate"):
+        candidate = next(item for item in task["candidates"] if item["id"] == task["candidate"])
+        record = candidate.get("verification", {})
+        if record.get("status") in {"running", "interrupted"}:
+            require(args.workers_stopped, "核查并停止验证及全部子进程后，再 --workers-stopped")
+            require(not record.get("pid") or owner_state(record) == "missing", "验证进程仍存在或无法确认已退出")
+            record.update(status="failed", error_type="interrupted", exit_code=1, ended=now())
+            save_task(directory, task)
+            return {"task": task["id"], "message": "仅结束中断验证记录，必须重新 verify；没有自动回填或释放资源"}
     if task["status"] == TaskStatus.CREATING:
         require(args.workers_stopped, "创建恢复前停止该任务写入，再 --workers-stopped")
         path = Path(task["path"])
@@ -692,7 +836,8 @@ def recover(args, directory, root, common):
     if task["status"] == TaskStatus.PREPARING:
         require(args.workers_stopped, "准备恢复前停止任务及候选写入，再 --workers-stopped")
         candidate = next(item for item in task["candidates"] if item["id"] == task["candidate"])
-        if Path(candidate["path"]).exists() and unresolved(candidate["path"]):
+        if Path(candidate["path"]).exists() and (unresolved(candidate["path"])
+                or (candidate.get("merge_complete") and candidate.get("merge_conflicted"))):
             candidate_lookup(task, common)
             task["status"] = TaskStatus.CONFLICT
             save_task(directory, task)
@@ -728,6 +873,7 @@ def recover(args, directory, root, common):
 
 def release(args, directory, root, common):
     task = load_task(args, directory)
+    no_pending_verification(task)
     require(task["status"] not in {TaskStatus.CREATING, TaskStatus.PUBLISHING, TaskStatus.PARKED, TaskStatus.RELEASED},
             "状态不允许释放；过渡状态先恢复")
     require(args.workers_stopped, "先停止全部写入者及服务，再 --workers-stopped")
@@ -767,7 +913,8 @@ def bundle_data(task):
         f"登记资源：{', '.join(task['resources']) or '无'}",
         f"统一脚本：{script}",
         f"在任务目录 guard --task {task['id']} --token {task['token']}，确认实际编辑器也以此目录为根。",
-        "若状态已暂停先 resume；已冻结要继续修改先 reopen。验证后 ready，审查任务树，prepare，验证及审查候选，publish。",
+        "若状态已暂停先 resume；已冻结要继续修改先 reopen。验证后 ready，审查任务树，prepare；冲突先 resolve。",
+        "配置 verification.commands 时，停止开发服务后 verify --workers-stopped --reviewed-tree <候选tree>，成功并审查后 publish；未配置时人工验证。",
         "不擅自提交、推送、部署或删除成果；停止本任务全部写入者和服务后才 release --workers-stopped。",
         "图形工具启动不会自动注入任务环境；读取环境文件并按实际项目启动方式使用，勿公开环境值。",
     ])
@@ -798,7 +945,7 @@ def launch(args, directory, root, common):
         environment = Path(task["environment_path"])
         require(environment.exists() and digest(environment.read_bytes()) == task["environment_sha256"],
                 "任务环境文件被修改或缺失，保留现场，请核查")
-        env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+        env = {key: value for key, value in os.environ.items() if not key.upper().startswith(("GIT_", "PARALLEL_"))}
         env.update(json.loads(environment.read_text(encoding="utf-8")))
         launch_id = uuid.uuid4().hex
         task["launch"] = {"id": launch_id, "status": "starting", "pid": None, "start": None,
@@ -830,7 +977,7 @@ def launch(args, directory, root, common):
 
 NEXT = {"creating": "doctor；停止写入后 recover --workers-stopped", "working": "guard 后开发/验证，再 ready",
         "ready": "审查任务 tree 后 prepare", "preparing": "doctor；停止写入后 recover --workers-stopped --reviewed-tree <任务tree>",
-        "conflict": "在候选解决并暂存；inspect、验证、审查后 resolve", "prepared": "验证、审查候选后 publish；过期先重新 prepare",
+        "conflict": "在候选解决并暂存；inspect、审查后 resolve", "prepared": "配置验证时先 verify，再审查 publish；过期重新 prepare",
         "publishing": "recover 核查回填现场", "published": "停止全部服务后 release --workers-stopped",
         "parked": "确认旧写入者已停止后 resume --workers-stopped", "released": "成果保留；新需求新建任务"}
 
@@ -888,8 +1035,23 @@ def doctor(args, directory, root, common):
                         "任务环境文件缺失或改变，保留现场")
             if task.get("candidate"):
                 candidate, path = candidate_lookup(task, common)
-                if unresolved(path):
+                if unresolved(path) or task["status"] == TaskStatus.CONFLICT:
                     findings.append({"task": task["id"], "kind": "candidate-conflict", "message": f"冲突保留于 {candidate['path']}"})
+                if candidate.get("environment_path"):
+                    fingerprint, _ = validation.candidate_inputs(task, candidate, candidate.get("tree"), git)
+                    record = candidate.get("verification", {})
+                    if record.get("status") in {"running", "interrupted"}:
+                        findings.append({"task": task["id"], "kind": "verification", "process_state": owner_state(record),
+                                         "message": "核查验证及其子进程；中断后 recover --workers-stopped，再重新 verify"})
+                    elif record.get("status") == "passed":
+                        changed = git(path, "diff", "--no-ext-diff", "--no-textconv", "--quiet", record["tree"], "--", check=False)
+                        require(changed.returncode in {0, 1}, "无法核对候选与验证记录的代码差异")
+                        untracked = git(path, "ls-files", "--others", "--exclude-standard", "-z").stdout
+                        index_changed = git(path, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--quiet",
+                                            record["tree"], "--", check=False)
+                        require(index_changed.returncode in {0, 1}, "无法核对候选索引与验证记录")
+                        if fingerprint != record["fingerprint"] or changed.returncode or index_changed.returncode or untracked:
+                            findings.append({"task": task["id"], "kind": "verification-stale", "message": "代码、索引或受管环境改变，验证记录已失效"})
         except (WorkflowError, OSError) as error:
             findings.append({"task": task["id"], "kind": "task-error", "message": str(error)})
         if task["status"] in {TaskStatus.CREATING, TaskStatus.PREPARING, TaskStatus.CONFLICT, TaskStatus.PUBLISHING}:
@@ -956,16 +1118,16 @@ def parser():
     admission.add_argument("--exclusive", action="append", default=[])
     admission.add_argument("--goal", default="")
     admission.add_argument("--worktree")
-    for name in ("guard", "ready", "reopen", "prepare", "inspect", "resolve", "publish", "recover", "release", "resume", "bundle", "launch"):
+    for name in ("guard", "ready", "reopen", "prepare", "inspect", "resolve", "verify", "publish", "recover", "release", "resume", "bundle", "launch"):
         command = sub.add_parser(name)
         command.add_argument("--task", required=True)
         command.add_argument("--token", required=True, help="任务接续码，不是安全认证")
-        if name in {"prepare", "resolve", "publish"}:
+        if name in {"prepare", "resolve", "verify", "publish"}:
             command.add_argument("--reviewed-tree", required=True)
         if name == "recover":
             command.add_argument("--reviewed-tree")
             command.add_argument("--expected-launch", help="核查并停止全部子进程后，确认 doctor 给出的 launch.id")
-        if name in {"reopen", "release", "resume", "recover"}:
+        if name in {"reopen", "release", "resume", "recover", "verify"}:
             command.add_argument("--workers-stopped", action="store_true")
         if name == "bundle":
             command.add_argument("--format", choices=("json", "text"), default="json")
@@ -1003,7 +1165,7 @@ def main():
             with task_locked(directory, args.task):
                 output = globals()[args.command](args, directory, root, common)
         print(output if isinstance(output, str) else json.dumps(public(output), ensure_ascii=True, indent=2))
-        return output["exit_code"] if args.command == "launch" else 0
+        return output["exit_code"] if args.command in {"launch", "verify"} else 0
     except (WorkflowError, OSError, ValueError) as error:
         details = {"error": str(error), "command": args.command}
         if directory and args.command not in {"status", "doctor", "events", "bundle"}:

@@ -20,7 +20,7 @@ description: 让 Codex、ZCode、OpenCode、Claude Code 或其他编程工具在
 
 ## 接入与启动
 
-读取 [操作说明](references/worktree.md)，首次先运行 `--help`。需要 Git、Python 3.9+；仅使用标准库。Windows 使用 `pwsh.exe`（PowerShell 7）。
+读取 [操作说明](references/worktree.md)，首次先运行 `--help`。需要支持 `merge-tree --write-tree -z --merge-base=<tree>` 的 Git、Python 3.9+；仅使用标准库。Windows 使用 `pwsh.exe`（PowerShell 7）。协议版本 4，所有参与者统一升级脚本后再操作。
 
 向首次使用者讲解或交接时，参考 [小白使用手册](references/beginner-guide.md)，涵盖概念、逐步操作、出错恢复和归档清理。释放资源不会删除 worktree；当前没有自动清理协议历史的命令。
 
@@ -47,8 +47,10 @@ python '<统一Skill绝对路径>/scripts/parallel_tasks.py' --repo '<原项目�
 每个任务独立执行：
 
 1. 完成必要验证，`ready` 冻结树；它不修改真实索引，也不生成 commit。停止写入，审查基线到任务树的实际 diff，核实验证证据。
-2. `prepare --reviewed-tree <任务tree>` 在独立候选上三方集成最新共享成果。候选应用仅持本任务锁，其他任务可继续操作；冲突现场保留，不阻塞其他任务。
-3. 在候选目录审查最终 diff，验证接口、数据和业务兼容。冲突手动解决并暂存；`inspect` 获取实际树，验证及审查后 `resolve`。
+2. `prepare --reviewed-tree <任务tree>` 使用原生树合并，在独立候选上集成最新共享成果并识别重命名。为候选复制白名单忽略文件并生成独立环境；候选应用仅持本任务锁，冲突现场保留。
+3. 在候选目录审查最终 diff，验证接口、数据和业务兼容。冲突手动解决并暂存；`inspect` 获取实际树，审查后 `resolve`。即使没有冲突索引，也要检查候选的 `merge_messages`，不能忽略目录重命名冲突。
+   - 配置了 `verification.commands`：先停止开发服务和旧验证进程，再 `verify --task <ID> --token <接续码> --reviewed-tree <候选tree> --workers-stopped`；成功记录绑定代码与受管环境，变化后须重验。
+   - 未配置验证命令：沿用项目要求人工验证。配置在 enter 时冻结；修改原项目配置不改变已有任务。
 4. `publish --reviewed-tree <候选tree>` 串行回填原目录暂存区。HEAD/基线过期或原目录出现未知内容时拒绝，重新 prepare、验证及审查，不能覆盖新成果。
 5. 真正停止任务全部写入者及服务后 `release --workers-stopped`。成果、目录和分支保留；未交付任务变 parked，以后 resume 重新检查资源和认领。
 
@@ -61,5 +63,7 @@ ready 不代表验收通过，publish 不代表已提交或部署。Git 没有�
 内核文件锁随进程退出释放，锁文件永久保留；等待超时不等于可以抢占。旧目录锁需停止旧脚本、核实 owner 主机/PID，并使用 doctor 指纹执行 recover-lock；不混用旧新版本。
 
 `recover` 根据真实内容恢复 creating/preparing/publishing 或中断启动记录。额外修改时保留现场；不能证明旧候选成功时创建新候选重新审查。具体条件见操作说明。`--workers-stopped` 是执行者确认，不能证明程序已停止全部子进程。
+
+验证记录停在 running/interrupted 时，先核查日志并真正停止验证及其子进程，再 `recover --workers-stopped`，随后重新 verify。verify 超时/中断只处理直接子进程；日志可能包含业务程序输出，应保留在受保护的本机目录。
 
 汇报任务实际目录、状态、是否回填、验证结果、占用资源及未完成项。只验证协议脚本时，不宣称已验证各产品自动加载规则、目录沙箱或真实业务集成。

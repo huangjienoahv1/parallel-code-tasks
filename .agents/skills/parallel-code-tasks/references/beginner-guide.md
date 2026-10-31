@@ -230,7 +230,9 @@ python $parallelScript --repo $projectPath status --format table
 function Invoke-ParallelJson {
     param([string[]]$CommandArguments, [string]$RepositoryPath = $projectPath)
     $resultLines = & python $parallelScript --repo $RepositoryPath @CommandArguments
-    if ($LASTEXITCODE -ne 0) { throw '协议命令失败，请先查看错误和 status，不执行后续步骤' }
+    if ($LASTEXITCODE -ne 0) {
+        throw ("协议命令失败，请查看错误、失败记录及 status，不执行后续步骤。`n" + ($resultLines -join "`n"))
+    }
     return (($resultLines -join "`n") | ConvertFrom-Json)
 }
 ```
@@ -331,12 +333,25 @@ if ($LASTEXITCODE -ne 0) { throw '读取候选差异失败' }
 
 ### 7.3 在候选目录验证，之后回填
 
-候选包含最新共享成果与本任务结果。项目构建、已有后端验证等应在候选目录执行；依赖和真实环境需要按项目准备。遵守项目约定，不新增前端测试环境，不把未进行的人工验收说成通过。
+候选包含最新共享成果与本任务结果。prepare 会从开发目录复制配置白名单中的忽略文件，并生成候选自己的环境文件。项目构建、已有后端验证等应在候选目录执行；依赖和外部数据库仍按项目准备。遵守项目约定，不新增前端测试环境，不把未进行的人工验收说成通过。
 
 ```powershell
 Set-Location -LiteralPath $candidateInfo.path
 # 在这里执行项目实际需要的构建/验证，命令以项目 README 为准。
 ```
+
+如果任务创建时配置了 `verification.commands`，必须先真正停止开发服务和旧验证程序，再执行下面命令；候选复用本任务登记的端口等资源：
+
+```powershell
+$verificationResult = Invoke-ParallelJson -CommandArguments @(
+    'verify', '--task', $taskInfo.id, '--token', $taskInfo.token,
+    '--reviewed-tree', $candidateInfo.tree, '--workers-stopped'
+)
+```
+
+verify 会在候选目录运行配置命令。命令失败、超时、候选代码或受管环境发生变化时，不能回填。失败时查看输出中的日志路径；也可通过 status 查候选的 verification 记录。未配置命令时沿用人工验证。配置在 enter 时冻结，后来修改原项目配置不影响已有任务，详见 [configuration.md](configuration.md)。
+
+验证记录因中断停在 running/interrupted 时，先实际停止验证及后代进程，用 `recover --workers-stopped` 结束记录，再重新 verify。超时或 Ctrl+C 只处理直接验证子进程，其他服务需自行核查。
 
 验证和审查通过、候选未被修改，再回填：
 
@@ -483,7 +498,7 @@ Set-Location -LiteralPath $candidateInfo.path
 git status --short
 ```
 
-文件里可能出现 `<<<<<<<`、`=======`、`>>>>>>>`。让 AI 根据业务意图合并双方修改、去掉标记并解释处理结果，不要全部选择“我的”或“他们的”。删除/改名/二进制冲突未必有这些标记，应结合 Git 状态检查。
+文件里可能出现 `<<<<<<<`、`=======`、`>>>>>>>`。让 AI 根据业务意图合并双方修改、去掉标记并解释处理结果，不要全部选择“我的”或“他们的”。删除/改名/二进制冲突未必有这些标记，应结合 Git 状态检查。inspect 返回的 `candidate.merge_messages` 包含冲突类型和路径；目录重命名冲突可能没有未合并索引，仍需审查并 resolve。
 
 只暂存实际解决的文件，示例路径替换为真实冲突文件：
 
@@ -494,19 +509,33 @@ git diff --name-only --diff-filter=U
 git diff --cached
 ```
 
-第一条 diff 不应再输出未解决文件。执行候选必要验证并审查后：
+第一条 diff 不应再输出未解决文件。审查解决后的候选树，再登记解决结果：
 
 ```powershell
 $inspection = Invoke-ParallelJson -CommandArguments @('inspect', '--task', $taskInfo.id, '--token', $taskInfo.token)
 if ($inspection.unresolved) { throw '仍有未解决冲突' }
 git -C $candidateInfo.path diff $candidateInfo.source_tree $inspection.actual_tree --
 if ($LASTEXITCODE -ne 0) { throw '读取解决后差异失败' }
-# 确认上面的实际树已验证、审查，再登记解决结果：
+# 确认上面的实际树已审查，再登记解决结果：
 $resolvedResult = Invoke-ParallelJson -CommandArguments @(
     'resolve', '--task', $taskInfo.id, '--token', $taskInfo.token,
     '--reviewed-tree', $inspection.actual_tree
 )
 $candidateInfo = $resolvedResult.candidate
+```
+
+随后按第 7.3 节执行验证：任务配置了 `verification.commands` 时，先实际停止开发服务，再运行：
+
+```powershell
+$verificationResult = Invoke-ParallelJson -CommandArguments @(
+    'verify', '--task', $taskInfo.id, '--token', $taskInfo.token,
+    '--reviewed-tree', $candidateInfo.tree, '--workers-stopped'
+)
+```
+
+未配置时完成项目要求的人工验证。验证和最终审查通过后再回填：
+
+```powershell
 $publishResult = Invoke-ParallelJson -CommandArguments @(
     'publish', '--task', $taskInfo.id, '--token', $taskInfo.token,
     '--reviewed-tree', $candidateInfo.tree

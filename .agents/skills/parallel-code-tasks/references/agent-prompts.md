@@ -31,6 +31,9 @@
 
 完成必要验证后 ready 并停止写入；审查任务树后 prepare，
 在独立候选目录解决冲突/验证/审查，再 publish 审查过的候选树。
+配置 verification.commands 时，冲突先 resolve，再停止开发服务，
+verify --reviewed-tree <候选tree> --workers-stopped 成功后才可 publish。
+未配置时按项目要求人工验证；配置在 enter 时冻结。
 过期候选重新 prepare，不直接覆盖原目录。其他任务无需等待。
 后继依赖任务在前置 publish 成功后 enter，不能依赖仅有文字的完成声明。
 真正停止全部写入者和服务后 release --workers-stopped。

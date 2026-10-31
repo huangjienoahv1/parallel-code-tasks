@@ -16,8 +16,9 @@ import uuid
 
 
 CONFIG_NAME = ".parallel-code-tasks.json"
+DEFAULT_VERIFICATION = {"commands": [], "timeout_seconds": 300}
 DEFAULT_CONFIG = {"version": 1, "copy_files": [], "env": {}, "resource_templates": [],
-                  "exclusive_paths": [], "port_range": [18000, 18999]}
+                  "exclusive_paths": [], "port_range": [18000, 18999], "verification": DEFAULT_VERIFICATION}
 RULE_BEGIN = "<!-- parallel-code-tasks:begin -->"
 RULE_END = "<!-- parallel-code-tasks:end -->"
 LOCK_WAIT = 5.0
@@ -206,6 +207,17 @@ def load_config(root):
     ports = config["port_range"]
     require(isinstance(ports, list) and len(ports) == 2 and all(type(p) is int for p in ports)
             and 1 <= ports[0] <= ports[1] <= 65535, "port_range 必须是合法端口区间")
+    verification = config["verification"]
+    require(isinstance(verification, dict) and not set(verification).difference(DEFAULT_VERIFICATION),
+            "verification 仅支持 commands 和 timeout_seconds")
+    verification = {**DEFAULT_VERIFICATION, **verification}
+    commands = verification["commands"]
+    require(isinstance(commands, list) and all(isinstance(argv, list) and argv
+            and all(isinstance(arg, str) and "\0" not in arg for arg in argv) and argv[0].strip()
+            for argv in commands), "verification.commands 必须是非空 argv 数组的列表，不接受 shell 字符串")
+    require(type(verification["timeout_seconds"]) is int and verification["timeout_seconds"] > 0,
+            "verification.timeout_seconds 必须是正整数，按每条命令计时")
+    config["verification"] = verification
     return config
 
 

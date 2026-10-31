@@ -34,7 +34,7 @@ flowchart LR
 
 ## 安装到你的项目
 
-需要 Git、Python 3.9+，只使用标准库，无第三方包。Windows 命令使用 PowerShell 7 的 `pwsh.exe`。当前行为验证在 Windows 完成，其他系统仍需实际验证。
+需要 Git、Python 3.9+，只使用标准库，无第三方包。Git 须支持 `merge-tree --write-tree -z --merge-base=<tree>`，prepare 会在创建候选前实测能力；本机已验证 Git 2.45.1.windows.1。Windows 命令使用 PowerShell 7 的 `pwsh.exe`。当前行为验证在 Windows 完成，其他系统仍需实际验证。
 
 先克隆本仓库到工具目录，再安装到**已有 Git 项目**。在 PowerShell 7 中：
 
@@ -55,7 +55,7 @@ python $parallelScript --repo $projectPath install --rules-file AGENTS.md --rule
 
 **先审查安装文件，按项目流程授权纳入 Git 基线，再开始并行任务。** 未提交规则在新 worktree 中可能缺失，通过原目录绝对路径读取；未知安装改动会阻止交付回填。脚本不替你自动 commit。
 
-升级先让所有参与者停止旧协议命令，使用新版来源执行 `install --update`；仅覆盖上次安装后未被用户修改的 Skill 文件，用户改动保留并明确报错。不混用旧目录锁版本与当前内核锁版本。
+升级先让所有参与者停止旧协议命令，使用新版来源执行 `install --update`；仅覆盖上次安装后未被用户修改的 Skill 文件，用户改动保留并明确报错。当前协议版本为 4，沿用 version=2 的登记；所有参与者需统一脚本，旧版本不能提供新的验证约束。
 
 ## 日常使用
 
@@ -103,11 +103,24 @@ python $parallelScript --repo . guard --task $task.id --token $task.token
 
 ~~~text
 guard → 开发与验证 → ready → 审查任务树
-→ prepare → 验证与审查候选 → publish
+→ prepare → 解决冲突（如有）→ 验证与审查候选 → publish
 → 真正停止本任务全部写入者及服务 → release --workers-stopped
 ~~~
 
 publish 只把成果回填原目录暂存区，不生成 commit。资源继续保留直到 release；暂停任务可 resume 接续原目录，重新检查占用，不自动拉取其他任务成果。
+
+### 候选合并与验证
+
+prepare 使用 Git 原生树合并识别重命名，将内容和冲突索引保留在独立候选中；补丁回填固定颜色和路径前缀，不受 `color.ui`、`diff.noprefix` 展示设置干扰。候选从任务目录复制白名单忽略文件，并生成指向候选目录的独立环境。
+
+在项目配置中声明 `verification.commands` 后，先停止开发服务，再验证候选：
+
+~~~powershell
+python $parallelScript --repo $projectPath verify --task $task.id --token $task.token --reviewed-tree $candidate.tree --workers-stopped
+if ($LASTEXITCODE -ne 0) { throw '候选验证失败，查看返回记录中的日志路径' }
+~~~
+
+`$candidate` 来自 prepare 的结果；冲突须先 resolve。verify 顺序执行配置命令，记录真实退出码和日志，成功结果绑定候选 tree、受管环境和白名单文件内容。配置了命令时 publish 要求有效的成功记录；未配置的项目继续人工验证。配置在 enter 时冻结，新增配置仅作用于新任务。详情见 [项目配置](.agents/skills/parallel-code-tasks/references/configuration.md) 与 [操作说明](.agents/skills/parallel-code-tasks/references/worktree.md)。
 
 ## 六项增强
 
@@ -161,6 +174,8 @@ python $parallelScript --repo $projectPath events --limit 20
 | [TheAhmadOsman/parallel-agent-worktree-skill](https://github.com/TheAhmadOsman/parallel-agent-worktree-skill) | AI CLI 的工作目录隔离 |
 
 ## 验证记录
+
+协议版本 4 补充验证：在 Windows / Python 3.13 / Git 2.45.1.windows.1 的独立临时克隆中，19 组场景通过，包括重命名与并行修改、文本/删除/二进制冲突、目录重命名、候选环境、验证失败和超时、受管输入变化失效、过期候选拒绝、父终端协议变量隔离及任务锁并发。无索引冲突、验证中断记录和回填中断恢复包含受控故障注入，不代表已验证所有真实进程崩溃场景。Python 3.9 语法兼容、UTF-8/LF、本地文档链接及新手失败处理示例检查通过；未向仓库新增测试文件。
 
 2026-10-03 使用独立临时 Git 仓库、真实 Git 操作和自制 CLI 辅助进程验证；未向发布仓库新增测试文件，未启动真实 AI 产品。
 

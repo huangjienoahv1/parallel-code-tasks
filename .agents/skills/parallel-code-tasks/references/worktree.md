@@ -2,7 +2,7 @@
 
 第一次接触 Git/worktree，请先看 [小白使用手册](beginner-guide.md)，其中包含逐步命令、故障恢复分流和归档清理流程。本页保留精确协议条件。
 
-scripts/parallel_tasks.py 使用 Git 和 Python 标准库；只有显式 launch 才启动调用者指定的程序。所有工具调用同一版本。Windows 使用 pwsh.exe（PowerShell 7），Python 3.9+。
+scripts/parallel_tasks.py 使用 Git 和 Python 标准库；launch 启动调用者指定的程序，verify 运行冻结配置中的验证命令。所有工具调用同一版本。Windows 使用 pwsh.exe（PowerShell 7），Python 3.9+。prepare 会在登记候选前实测 Git 是否支持 merge-tree --write-tree -z --merge-base=<tree>，不支持时明确报错。
 
 ## 持久登记与目录
 
@@ -11,9 +11,9 @@ scripts/parallel_tasks.py 使用 Git 和 Python 标准库；只有显式 launch 
 - 每个任务目录为 <项目名>.parallel/<任务ID-随机ID>/work，独立分支；每次 prepare 新建 publish-<随机ID> 候选。目录均在原项目之外。
 - task ID 在仓库内唯一，agent 是任意产品标签。token 用于防止误接管，存在本机登记中，不是密码或强身份认证。status 不显示 token；丢失时在确认所有者后查看本机登记，不猜测或重新领取同 ID。
 - enter --worktree 可接入原生工具创建的 worktree，要求干净、同仓库、独立未分配分支、HEAD 等于登记的 source.head。原生归档由原生工具处理。
-- 成功输出 JSON，失败在 stderr 输出 JSON 并返回非零码。第一次 status 的 source 是 null，不创建项目内容。
+- 成功输出 JSON，协议错误在 stderr 输出 JSON 并返回非零码。verify 的子命令失败返回非零码，同时在 stdout 输出含失败记录的 JSON；业务输出在独立日志。第一次 status 的 source 是 null，不创建项目内容。
 - V1 state.json 保留；有活动批次时拒绝混用。先用保存的 V1 版本处理完成或人工归档，不能直接删旧登记绕过。V2 不再使用 init/add/coordinator/handoff/close。
-- 当前协议增强版本为 3，沿用 version=2 的登记结构，读取既有任务时补默认字段，保留原路径/凭据/基线。升级前停止旧版协议命令，不让目录锁和内核锁混用。
+- 当前协议增强版本为 4，沿用 version=2 的登记结构，保留既有任务路径/凭据/基线；旧任务缺少 verification 时按人工验证处理。升级前停止旧版协议命令并统一脚本，旧脚本不能提供验证约束，禁止混用。
 - 全局 mutex.lock 保护共享登记、worktree 注册和回填；task-locks/<ID>.lock 保护本任务变更。任务快照、候选应用和 CLI 等待在全局锁外，最终 publish 仍检查共享基线。
 - events.jsonl 记录操作、状态、候选和失败类型；不记录环境值、接续码及完整启动参数。登记成功但日志写入失败会明确报告，不能假定操作未发生。
 
@@ -100,6 +100,9 @@ if ($LASTEXITCODE -ne 0) { throw '候选准备失败；status 查看保留的现
 $candidate = ($prepareJson | ConvertFrom-Json).candidate
 # 在 candidate.path 执行整体验证并检查最终差异。
 git -C $candidate.path diff $candidate.source_tree $candidate.tree --
+# 配置了 verification.commands 时，实际停止开发服务后执行；未配置则人工验证：
+# python $parallelScript --repo . verify --task $task.id --token $task.token --reviewed-tree $candidate.tree --workers-stopped
+# if ($LASTEXITCODE -ne 0) { throw '候选验证失败，查看返回的日志路径' }
 # 审查通过才回填；其他任务仍可继续开发。
 python $parallelScript --repo . publish --task $task.id --token $task.token --reviewed-tree $candidate.tree
 # 实际停止所有相关执行者和服务后：
@@ -108,20 +111,35 @@ python $parallelScript --repo . release --task $task.id --token $task.token --wo
 
 每次命令都检查退出码再执行下一步。脚本不代替业务审查或构建，--reviewed-tree 是执行者确认具体成果已审查。prepare 的 task SHA 与 publish 的 candidate SHA 用途不同。
 
-ready 使用临时索引，包含非忽略新文件及显式暂存的文件（含 force 添加的忽略文件），不修改任务真实索引；未跟踪的忽略文件、运行状态/数据库不包含。prepare 使用三方补丁，publish 先检查再应用到原目录索引，保持结果暂存；不保留任务 commit 历史。
+ready 使用临时索引，包含非忽略新文件及显式暂存的文件（含 force 添加的忽略文件），不修改任务真实索引；未跟踪的忽略文件、运行状态/数据库不包含。prepare 使用 merge-tree 对 baseline_tree、source_tree、task.tree 原生三方合并，支持重命名识别，再在新候选检出内容并恢复冲突索引。publish 先检查再应用到原目录索引，保持结果暂存；不保留任务 commit 历史。内部补丁固定无颜色及 a/、b/ 前缀。
 
 快照树用 refs/parallel-code-tasks/ 保留避免 GC 回收，不创建 commit；不会替代业务分支的提交历史。不要手动删除这些共享引用。脚本不修改全局配置、不推送、不强制清理、不删除 worktree/分支。
 
+## 验证候选
+
+配置格式见 [configuration.md](configuration.md)。配置在 enter 时冻结；已有任务按创建时配置运行。prepare 自动复制任务白名单忽略文件并生成候选环境。旧候选缺少环境元数据时，首次显式 verify 会补齐。
+
+~~~powershell
+# 已解决冲突并 resolve；实际停止开发服务、旧验证进程之后：
+python $parallelScript --repo $projectPath verify --task $task.id --token $task.token --reviewed-tree $candidate.tree --workers-stopped
+if ($LASTEXITCODE -ne 0) { throw '验证失败或中断，查看记录与日志，不能 publish' }
+~~~
+
+verify 仅接受 prepared 候选，要求 reviewed-tree 与当前候选一致，并检查任务冻结内容、独占认领及共享基线。命令在候选目录顺序运行，注入候选环境；日志位于源码外。验证前记录 running，失败、超时或验证过程中修改代码/受管环境都不会生成成功凭据。
+
+配置了命令时，publish 要求当前候选有与代码、环境和白名单文件内容匹配的 passed 记录。候选过期先重新 prepare；白名单内容修改后重验；环境 JSON 修改需重新 prepare；未配置命令时仍需人工验证和审查，verify 会提示未配置。验证不能代替业务审查，也不管理外部数据库数据。
+
 ## 冲突、过期、暂停、中断
 
-- conflict：status 找到该任务的当前 candidate/path。只在该候选解决冲突，git add 相关文件，必要验证后 inspect 得到 actual_tree；审查此树后 resolve --reviewed-tree <actual_tree>，再 publish。其他任务照常进入/开发/交付。
+- conflict：status 找到该任务的当前 candidate/path。inspect 的 candidate.merge_messages 保留冲突类型和路径；目录重命名冲突可能没有未合并索引，不代表合并成功。只在该候选解决冲突，git add 相关文件，inspect 得到 actual_tree；审查后 resolve --reviewed-tree <actual_tree>。配置了命令时再 verify，验证与审查通过后 publish。
 - prepared 已过期：其他任务先回填或用户产生新提交，publish 拒绝。再次 prepare --reviewed-tree <同一任务tree> 创建新候选，保留旧目录；验证、重新审查新候选再 publish。不要把旧候选修复直接覆盖原目录。若新候选仍冲突，按语义重新解决。
 - ready 后修改：先 reopen --workers-stopped，使旧候选失效；修订后重新 ready。不能用旧快照 SHA。
 - 暂停：确认全部写入者、服务停止后 release --workers-stopped；状态 parked，资源释放但目录/成果保留。之后 resume --workers-stopped 重新占用资源并恢复暂停前状态，基线不自动变化。已交付任务 released 后新需求新建 ID。
 - publishing/pending：执行 recover。已完整应用则完成登记，未应用则恢复 prepared；HEAD/树/索引有额外改动则拒绝，保留现场人工核查。不要盲目再 apply。
-- preparing：停止任务/候选写入后 recover --workers-stopped --reviewed-tree <任务tree>。发现真实未解决冲突则登记 conflict；其余场景保留旧候选，创建新候选重新验证及审查，不把未知部分应用宣称为成功。
+- preparing：停止任务/候选写入后 recover --workers-stopped --reviewed-tree <任务tree>。发现真实未解决冲突，或已完整物化的树合并冲突时登记 conflict；其余场景保留旧候选，创建新候选重新验证及审查，不把未知部分应用宣称为成功。candidate.failure_kind 区分 merge-conflict 和 prepare-error，后者需先按 error 核查执行原因。
 - creating：停止写入后 recover --workers-stopped。仅恢复缺失的受管 worktree 或内容精确等于已提交/完整基线的目录，再复制白名单和配置环境；HEAD、索引或文件存在未知内容时拒绝，保留现场。不强制移除 worktree 注册，不直接重新 enter 同 ID。
 - 启动记录 starting/running/interrupted：先 doctor 核对 launch.id，实际停止全部相关进程。登记进程必须已退出，才能 recover --workers-stopped --expected-launch <launch.id>；未记录 PID 的启动窗口依赖执行者确认，不能证明程序自动发现或停止子进程。只结束登记，不释放资源。
+- 验证记录 running/interrupted：先确认验证程序、后代进程及开发服务已停止，再 recover --workers-stopped。登记 PID 仍存活或无法确认时拒绝；恢复只将验证标记为失败，随后重新 verify，不自动放行回填。verify 超时/Ctrl+C 仅停止直接子进程，后代进程由执行者核查。
 - 内核锁：进程退出自动释放，锁文件永久保留。残留 owner 只是诊断记录，下一次合法获取锁可替换它；不要删除锁文件制造第二个锁。
 - 旧目录 lock：doctor 返回 owner 主机/PID、进程状态及 fingerprint。确认为同主机失效 owner 并停止旧版脚本后 recover-lock --workers-stopped --expected-owner <fingerprint>。仅删除对应 owner 和空目录；活进程、其他主机、未知内容或指纹变化均拒绝。
 
